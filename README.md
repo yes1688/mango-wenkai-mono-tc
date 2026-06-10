@@ -8,6 +8,10 @@
 
 ![terminal](preview-terminal.png)
 
+### Agent 對話
+
+![chat](preview-chat.png)
+
 ## 為什麼做這個
 
 LXGW WenKai（霞鶩文楷）是最美的開源楷體，但它是為閱讀設計的——符號畫在全形字身，放進終端機會爆框、偏移、框線接不起來。
