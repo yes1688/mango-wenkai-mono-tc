@@ -24,7 +24,10 @@
   - 垂直對齊 target_vc × UPM。
   - advance 不動（保住 terminal 等寬）。
 
-範圍 = contained 符號（標點/箭頭/技術/幾何）。**不含會 tiling 的 box/block**
+範圍 = contained 符號（Latin-1 符號 / 標點 / 字母符號 / 數字形式 / 箭頭 / 技術 /
+  帶圈字母數字 / 幾何 / 雜項符號 / Dingbats / 箭頭B；逐字 target 見 iosevka_targets.py。
+  **字母一律排除**——字母坐 baseline，垂直置中會拉離基線；ℹ 等「歸類字母實為符號」例外）。
+  **不含會 tiling 的 box/block**
   （U+2500-257F / U+2580-259F）——那是結構符號，uniform scale 救不了楷體全形
   字身（寬高雙錯，數學證明見 task da073d67），LXGW 走移除 cmap → fallback Sarasa；
   Mango box 原生已對齊不動。⌘(U+2318) 由 fit 既有階段處理。§5 大括號/積分延伸段
