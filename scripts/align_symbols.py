@@ -24,6 +24,15 @@
   - 垂直對齊 target_vc × UPM。
   - advance 不動（保住 terminal 等寬）。
 
+legibility override（例外於「只縮不放」，見 legibility_overrides.py 單一事實源）：
+  容器類符號（圈/框裡有數字或字母）抄 Iosevka 小圈慣例會縮到 0.436em 不可辨認
+  （spec: docs/plans/20260716_font_symbol_legibility_spec.md），故兩類 override：
+  - OVERRIDES_EXACT（P1 帶圈 U+2460-24FF / U+2776-2793）：雙向精準對齊 override
+    wr（放大或縮小），三字型落同一容差 → 視覺一致。
+  - OVERRIDES_MIN_H（P2 №/℅/分數等）：僅 bbox 高 < MIN_LEGIBLE_EM 才放大到
+    override wr（救援被縮壞的字；Sarasa 原生半形設計已達標者不動）。
+  override 優先於 TARGETS；ASCII 保護照舊。
+
 範圍 = contained 符號（Latin-1 符號 / 標點 / 字母符號 / 數字形式 / 箭頭 / 技術 /
   帶圈字母數字 / 幾何 / 雜項符號 / Dingbats / 箭頭B；逐字 target 見 iosevka_targets.py。
   **字母一律排除**——字母坐 baseline，垂直置中會拉離基線；ℹ 等「歸類字母實為符號」例外）。
@@ -55,6 +64,10 @@ sys.path.insert(0, SCRIPT_DIR)
 from fit_glyph_to_advance import apply_outline_transform
 # Iosevka per-glyph 佔格 target（自動產生，見 gen_iosevka_targets.py）。
 from iosevka_targets import TARGETS
+# 容器類符號可辨認性 override（自動產生，見 gen_legibility_overrides.py）：
+# EXACT（P1 帶圈類）雙向精準對齊；MIN_H（P2 複合字母/分數）高度不足才放大。
+# override 優先於 TARGETS（verify_font_metrics 同步吃這兩張表）。
+from legibility_overrides import OVERRIDES_EXACT, OVERRIDES_MIN_H, OVERRIDES, MIN_LEGIBLE_EM
 
 # golden / report 共用容差（DRY；verify_font_metrics 與 report 引用）。
 WR_TOL = 0.05   # wr 上界容差：寬度 > target_wr + WR_TOL 才縮（下界不限 → 不放大過小符號）
@@ -63,13 +76,19 @@ VC_TOL = 0.04   # 垂直中心容差
 
 
 def compute_align_transform(
-    xmin, ymin, xmax, ymax, advance, upm, target_wr, target_hc, target_vc
+    xmin, ymin, xmax, ymax, advance, upm, target_wr, target_hc, target_vc,
+    enlarge="never",
 ):
-    """純函式：算把 glyph 對齊 Iosevka target 所需的 (scale, dx, dy)。
+    """純函式：算把 glyph 對齊 target 所需的 (scale, dx, dy)。
 
-    - scale：當寬度覆蓋超過 Iosevka（cur_wr > target_wr + WR_TOL）才 = target_wr/
-             cur_wr（縮到 Iosevka 覆蓋），否則 1.0。**只縮不放大**（過小符號維持，
-             符合 · • 語意）；cur_wr > target_wr 時 scale 必 < 1，無需 clamp。
+    - scale：當寬度覆蓋超標（cur_wr > target_wr + WR_TOL）= target_wr/cur_wr
+             （縮到 target 覆蓋）。低於下界（cur_wr < target_wr − WR_TOL）時依
+             enlarge 模式決定是否放大到 target：
+               "never"    絕不放大（既有語意：過小符號維持，符合 · • 語意）
+               "always"   放大（legibility EXACT：帶圈類精準對齊、三字型一致）
+               "if_short" 僅當 bbox 高 < MIN_LEGIBLE_EM×upm 才放大（legibility
+                          MIN_H：救援縮壞的字、不動原生已可辨認的字）
+             容差帶內 scale=1（冪等）。
     - dx：水平置中到 target_hc × advance。
     - dy：垂直對齊 target_vc × upm（縮放後再平移到目標中心）。
 
@@ -82,6 +101,17 @@ def compute_align_transform(
     cur_wr = w / advance
     if cur_wr > target_wr + WR_TOL:
         scale = (target_wr * advance) / w   # = target_wr / cur_wr < 1
+    elif enlarge == "always" and cur_wr < target_wr - WR_TOL:
+        scale = (target_wr * advance) / w   # = target_wr / cur_wr > 1（放大）
+    elif (
+        enlarge == "if_short"
+        and (ymax - ymin) < MIN_LEGIBLE_EM * upm
+        and cur_wr < target_wr
+    ):
+        # MIN_H 的本質是高度：高度不足就放大到 target，**不吃 wr 容差 deadband**
+        # （否則 cur_wr 落在 target±WR_TOL 帶內的字救不到，如 LXGW Bold ℃）。
+        # 放大後高度 ≥ MIN_TARGET_EM > MIN_LEGIBLE_EM → 下次不再觸發，冪等收斂。
+        scale = (target_wr * advance) / w
     else:
         scale = 1.0
 
@@ -99,11 +129,18 @@ def _glyph_bounds(font, glyph_name):
 
 
 def _is_noop(scale, dx, dy):
-    """scale≈1 且平移可忽略 → 不需改 outline（避免無謂改寫、保持冪等）。"""
-    return scale == 1.0 and abs(dx) < 0.5 and abs(dy) < 0.5
+    """scale≈1 且平移可忽略 → 不需改 outline（避免無謂改寫、保持冪等）。
+
+    邊界含 0.5：TrueType 座標是整數，bbox 中心落在 .5（xmin+xmax 奇數）時
+    dx/dy 恰為 ±0.5；若視為需修改，rounding 後每跑平移 1 unit 再彈回 →
+    重複執行無限震盪（Bold 例外路徑會重跑 align，spec 依賴其冪等）。"""
+    return scale == 1.0 and abs(dx) <= 0.5 and abs(dy) <= 0.5
 
 
-def align_glyph(font, glyph_name, advance, upm, target_wr, target_hc, target_vc):
+def align_glyph(
+    font, glyph_name, advance, upm, target_wr, target_hc, target_vc,
+    enlarge="never",
+):
     """把 glyph_name 對齊 target（縮放 + 置中），原地替換 outline。
 
     回傳 (scale, dx, dy)；no-op 時回 (1.0, 0.0, 0.0) 且不改字型。
@@ -114,7 +151,8 @@ def align_glyph(font, glyph_name, advance, upm, target_wr, target_hc, target_vc)
 
     xmin, ymin, xmax, ymax = bounds
     scale, dx, dy = compute_align_transform(
-        xmin, ymin, xmax, ymax, advance, upm, target_wr, target_hc, target_vc
+        xmin, ymin, xmax, ymax, advance, upm, target_wr, target_hc, target_vc,
+        enlarge=enlarge,
     )
     if _is_noop(scale, dx, dy):
         return (1.0, 0.0, 0.0)
@@ -123,13 +161,26 @@ def align_glyph(font, glyph_name, advance, upm, target_wr, target_hc, target_vc)
     return (scale, dx, dy)
 
 
-def align_codepoint(font, cp, targets=None):
+def _resolve_target(cp, targets, overrides_exact, overrides_min_h):
+    """回傳 (target三元組, enlarge模式)；不在任一表 → (None, None)。
+    override 優先於 TARGETS（兩張 override 表 cp 不重疊，生成時保證）。"""
+    if cp in overrides_exact:
+        return overrides_exact[cp], "always"
+    if cp in overrides_min_h:
+        return overrides_min_h[cp], "if_short"
+    target = targets.get(cp)
+    return (target, "never") if target is not None else (None, None)
+
+
+def align_codepoint(font, cp, targets=None, overrides_exact=None, overrides_min_h=None):
     """對單一 codepoint 做對齊。回傳 True 表示有修改。"""
     if 0x00 <= cp <= 0x7F:
         raise ValueError(f"拒絕修改 ASCII 區 U+{cp:04X}")
 
     targets = targets if targets is not None else TARGETS
-    target = targets.get(cp)
+    overrides_exact = overrides_exact if overrides_exact is not None else OVERRIDES_EXACT
+    overrides_min_h = overrides_min_h if overrides_min_h is not None else OVERRIDES_MIN_H
+    target, enlarge = _resolve_target(cp, targets, overrides_exact, overrides_min_h)
     if target is None:
         return False
     target_wr, target_hc, target_vc = target
@@ -146,7 +197,7 @@ def align_codepoint(font, cp, targets=None):
         return False
 
     scale, dx, dy = align_glyph(
-        font, gn, advance, upm, target_wr, target_hc, target_vc
+        font, gn, advance, upm, target_wr, target_hc, target_vc, enlarge=enlarge
     )
     return not _is_noop(scale, dx, dy)
 
@@ -180,9 +231,11 @@ def _flatten_target_composites(font, targets):
     return len(pens)
 
 
-def align_file(path, targets=None):
-    """開啟 TTF、對 targets 內所有 codepoint 對齊、原地覆寫。"""
+def align_file(path, targets=None, overrides_exact=None, overrides_min_h=None):
+    """開啟 TTF、對 targets ∪ overrides 內所有 codepoint 對齊、原地覆寫。"""
     targets = targets if targets is not None else TARGETS
+    overrides_exact = overrides_exact if overrides_exact is not None else OVERRIDES_EXACT
+    overrides_min_h = overrides_min_h if overrides_min_h is not None else OVERRIDES_MIN_H
     print(f"處理：{path}")
     font = TTFont(path)
     if "glyf" not in font:
@@ -190,13 +243,14 @@ def align_file(path, targets=None):
         font.close()
         return 0
 
-    flat = _flatten_target_composites(font, targets)
+    all_cps = set(targets) | set(overrides_exact) | set(overrides_min_h)
+    flat = _flatten_target_composites(font, all_cps)
     if flat:
         print(f"  flatten {flat} 個 composite glyph")
 
     n = 0
-    for cp in sorted(targets):
-        if align_codepoint(font, cp, targets):
+    for cp in sorted(all_cps):
+        if align_codepoint(font, cp, targets, overrides_exact, overrides_min_h):
             n += 1
 
     if n:
@@ -208,16 +262,20 @@ def align_file(path, targets=None):
     return n
 
 
-def check_file(path, targets=None):
-    """只檢查不修改：統計達標率（wr 上界 / hc / vc 對 target 誤差）。"""
+def check_file(path, targets=None, overrides_exact=None, overrides_min_h=None):
+    """只檢查不修改：統計達標率。判準隨語意分流——
+    TARGETS：wr 上界 / hc / vc；EXACT：wr 雙向；MIN_H：wr 上界 + 高度下限。"""
     targets = targets if targets is not None else TARGETS
+    overrides_exact = overrides_exact if overrides_exact is not None else OVERRIDES_EXACT
+    overrides_min_h = overrides_min_h if overrides_min_h is not None else OVERRIDES_MIN_H
     print(f"檢查：{path}")
     font = TTFont(path)
     cmap = font.getBestCmap() or {}
     upm = font["head"].unitsPerEm
     have = ok = 0
-    for cp in sorted(targets):
-        target_wr, target_hc, target_vc = targets[cp]
+    for cp in sorted(set(targets) | set(overrides_exact) | set(overrides_min_h)):
+        target, enlarge = _resolve_target(cp, targets, overrides_exact, overrides_min_h)
+        target_wr, target_hc, target_vc = target
         gn = cmap.get(cp)
         if gn is None:
             continue
@@ -229,8 +287,15 @@ def check_file(path, targets=None):
         wr = (bounds[2] - bounds[0]) / advance
         hc = (bounds[0] + bounds[2]) / 2 / advance
         vc = (bounds[1] + bounds[3]) / 2 / upm
+        h_em = (bounds[3] - bounds[1]) / upm
+        if enlarge == "always":
+            good_wr = abs(wr - target_wr) <= WR_TOL
+        elif enlarge == "if_short":
+            good_wr = wr <= target_wr + WR_TOL and h_em >= MIN_LEGIBLE_EM
+        else:
+            good_wr = wr <= target_wr + WR_TOL
         good = (
-            wr <= target_wr + WR_TOL
+            good_wr
             and abs(hc - target_hc) <= HC_TOL
             and abs(vc - target_vc) <= VC_TOL
         )
@@ -238,8 +303,9 @@ def check_file(path, targets=None):
             ok += 1
         else:
             print(
-                f"  U+{cp:04X}（{gn}）wr={wr:.2f}(≤{target_wr + WR_TOL:.2f}?) "
-                f"hc={hc:.2f}(目標{target_hc:.2f}) vc={vc:.2f}(目標{target_vc:.2f})"
+                f"  U+{cp:04X}（{gn}）wr={wr:.2f}(目標{target_wr:.2f}/{enlarge}) "
+                f"hc={hc:.2f}(目標{target_hc:.2f}) vc={vc:.2f}(目標{target_vc:.2f}) "
+                f"h={h_em:.2f}em"
             )
     print(f"  達標 {ok}/{have}")
     font.close()

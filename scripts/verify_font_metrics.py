@@ -11,6 +11,9 @@ rebuild-fonts.sh 跑完 strip→normalize→complete→fit 後，用本腳本對
 
   1. [strip]     GSUB LookupType-4（Ligature Substitution）lookup 數 == 0
                  → strip_ligatures.py 的產出：連字 lookup 已清乾淨。
+  1b.[calt]      GSUB FeatureList 無 calt（Contextual Alternates）feature record == 0
+                 → strip_calt.py 的產出：calt 連字（:: -> != 等 ChainingContext+Single
+                  觸發）的觸發源已移除；shaper 預設不再跑這套替換。
   2. [normalize] '中'(U+4E2D, EAW=W) 的 advance == 2 × 'M'(U+004D) 的 advance
                  → normalize_advances.py 的產出：全形 2:1 對齊 terminal EAW。
   3. [complete]  ▰(U+25B0) 存在，且其 bbox（含位置）== ▱(U+25B1) 的 bbox
@@ -19,7 +22,8 @@ rebuild-fonts.sh 跑完 strip→normalize→complete→fit 後，用本腳本對
                   其 xMin（與來源對齊），否則 ▰ 會相對 ▱ 左移、進度條 ▰▱ 並排錯位。
   4. [fit]       ⌘(U+2318) bbox 寬 ≤ advance（不爆框），且寬/advance ≈ MAX_RATIO
                  → fit_glyph_to_advance.py 的產出：爆框符號已縮進框並置中。
-  5. [align]     contained 符號（TARGETS，標點/箭頭/技術/幾何）逐字對齊 Iosevka：
+  5. [align]     contained 符號（TARGETS，Latin-1 符號/標點/字母符號/數字形式/箭頭/
+                 技術/帶圈/幾何/雜項/Dingbats/箭頭B；字母排除）逐字對齊 Iosevka：
                  wr ≤ target+WR_TOL（不爆框超過覆蓋）、|hc−target|≤HC_TOL（水平置中）、
                  |vc−target|≤VC_TOL（垂直對齊）→ align_symbols.py 的產出。**三字型全驗**
                  （Mango/LXGW/Sarasa 皆可選為主字型）。
@@ -34,6 +38,13 @@ rebuild-fonts.sh 跑完 strip→normalize→complete→fit 後，用本腳本對
                  相同，等同性即是「LXGW 框線 == 已驗 tiling 的 Sarasa 框線」的精確證明。
   7. [bold-lock] 僅 *-Bold：cell 網格與同目錄 *-Regular 逐字一致（終端等寬 Regular/Bold
                  同欄寬）—— M 相等 + cmap 交集逐字 advance 相等。非 Bold 字型跳過此條。
+  8. [legibility] 容器類符號可辨認性（legibility_overrides，spec 20260716）：
+                 P1 帶圈區段（U+2460-24FF / U+2776-2793）cmap 覆蓋 100%（Mango 由
+                 inject_symbol_glyphs 植入 Sarasa glyph）；override cp 逐字 —— EXACT
+                 雙向 |wr−target|≤WR_TOL（放大後三字型一致）、MIN_H 上界；共通
+                 hc/vc 容差 + bbox 高 ≥ MIN_LEGIBLE_EM（0.5em 可辨認下限）→
+                 align_symbols(enlarge) + inject_symbol_glyphs 的產出。invariant 5
+                 對 override cp 讓位（此條驗）。
 
 用法：
   python3 verify_font_metrics.py <font.ttf> [font2.ttf ...]
@@ -53,7 +64,17 @@ sys.path.insert(0, SCRIPT_DIR)
 from fit_glyph_to_advance import MAX_RATIO
 # DRY：符號對齊的 target 表與容差唯一定義在 align_symbols / iosevka_targets，驗證沿用。
 from align_symbols import TARGETS, WR_TOL, HC_TOL, VC_TOL
+# DRY：可辨認性 override 表唯一定義在 legibility_overrides（gen 自動產生），驗證沿用。
+from legibility_overrides import (
+    OVERRIDES, OVERRIDES_EXACT, MIN_LEGIBLE_EM, P1_RANGES, CIRCLED_WR,
+)
+# 表健全性守門（QA F2 事故防線）：表若被範圍外的 --circled-wr 重生（如 0-表），
+# 逐字 invariant 會與壞表「自洽通過」——在 import 時就擋，golden gate 不背書壞表。
+from gen_legibility_overrides import validate_circled_wr
+validate_circled_wr(CIRCLED_WR)
 from box_tiling import check_tiling
+# DRY：calt 偵測唯一定義在 strip_calt，驗證沿用同一函式。
+from strip_calt import calt_feature_count
 
 # box drawing + block 範圍（invariant 6：LXGW 應移除 cmap、Sarasa 應 tiling）。
 BOX_BLOCK_RANGE = range(0x2500, 0x25A0)
@@ -126,6 +147,10 @@ def verify_font(path):
         lig = _ligature_lookup_count(font)
         check(lig == 0, "strip", f"GSUB Ligature(type4) lookup = {lig}（應 0）")
 
+        # 1b. calt：無 calt feature record（contextual 連字 :: -> != 等的觸發源）
+        calt = calt_feature_count(font)
+        check(calt == 0, "calt", f"GSUB calt feature record = {calt}（應 0）")
+
         # 2. normalize：中.advance == 2 × M.advance
         w_gn = cmap.get(CP_WIDE)
         if w_gn is None:
@@ -176,10 +201,13 @@ def verify_font(path):
 
         # 5. align：contained 符號逐字對齊 Iosevka（wr 上界 / hc / vc）。三字型全驗
         #    （Mango/LXGW/Sarasa 皆可選為主字型，contained 都要對齊）。
+        #    legibility override cp 語意不同（放大），由 invariant 8 驗，此處跳過。
         upm = font["head"].unitsPerEm
         bad = []
         have = 0
         for cp, (target_wr, target_hc, target_vc) in sorted(TARGETS.items()):
+            if cp in OVERRIDES:
+                continue
             gn = cmap.get(cp)
             if gn is None:
                 continue  # 該字型缺此符號，非本 task 補字範圍
@@ -202,6 +230,57 @@ def verify_font(path):
             "align",
             f"contained 符號全對齊（{have} 字）"
             if not bad else f"{len(bad)}/{have} 未對齊：{', '.join(bad[:8])}",
+        )
+
+        # 8. legibility：容器類符號可辨認性（override 表，spec 20260716）。
+        #    (a) P1 帶圈區段 cmap 覆蓋 100%（Mango 由 inject_symbol_glyphs 植入）；
+        #    (b) override cp 逐字：EXACT 雙向 |wr−t|≤tol（三字型一致）、MIN_H 上界
+        #        wr≤t+tol；共通 hc/vc 容差 + bbox 高 ≥ MIN_LEGIBLE_EM（可辨認下限）。
+        #    P2 缺字（Mango 41 字）跳過——inject 範圍僅 P1（spec 修法 B），P2 缺字
+        #    走 fallback，非本 task 補字範圍。
+        p1_missing = [
+            cp for lo, hi in P1_RANGES for cp in range(lo, hi + 1) if cp not in cmap
+        ]
+        bad_leg = []
+        have_leg = 0
+        for cp, (t_wr, t_hc, t_vc) in sorted(OVERRIDES.items()):
+            gn = cmap.get(cp)
+            if gn is None:
+                continue
+            adv = hmtx[gn][0]
+            b = _bbox(font, gn)
+            if b is None or adv <= 0:
+                continue
+            have_leg += 1
+            wr = (b[2] - b[0]) / adv
+            hc = (b[0] + b[2]) / 2 / adv
+            vc = (b[1] + b[3]) / 2 / upm
+            h_em = (b[3] - b[1]) / upm
+            wr_ok = (
+                abs(wr - t_wr) <= WR_TOL
+                if cp in OVERRIDES_EXACT
+                else wr <= t_wr + WR_TOL
+            )
+            if not (
+                wr_ok
+                and abs(hc - t_hc) <= HC_TOL
+                and abs(vc - t_vc) <= VC_TOL
+                and h_em >= MIN_LEGIBLE_EM
+            ):
+                bad_leg.append(
+                    f"U+{cp:04X}(wr={wr:.2f}/hc={hc:.2f}/vc={vc:.2f}/h={h_em:.2f}em)"
+                )
+        n_p1 = sum(hi - lo + 1 for lo, hi in P1_RANGES)
+        check(
+            not p1_missing and not bad_leg,
+            "legibility",
+            f"帶圈 cmap {n_p1 - len(p1_missing)}/{n_p1}、override {have_leg} 字全達標"
+            if not p1_missing and not bad_leg
+            else (
+                f"帶圈 cmap 缺 {len(p1_missing)}"
+                + (f"（如 U+{p1_missing[0]:04X}…）" if p1_missing else "")
+                + f"；未達標 {len(bad_leg)}/{have_leg}：{', '.join(bad_leg[:6])}"
+            ),
         )
 
         # 6. box 自包含：LXGW box/block 已植入 Sarasa glyph（160 全有、advance 鎖半形、
