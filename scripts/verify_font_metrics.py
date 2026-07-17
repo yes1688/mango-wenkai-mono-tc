@@ -38,13 +38,15 @@ rebuild-fonts.sh 跑完 strip→normalize→complete→fit 後，用本腳本對
                  相同，等同性即是「LXGW 框線 == 已驗 tiling 的 Sarasa 框線」的精確證明。
   7. [bold-lock] 僅 *-Bold：cell 網格與同目錄 *-Regular 逐字一致（終端等寬 Regular/Bold
                  同欄寬）—— M 相等 + cmap 交集逐字 advance 相等。非 Bold 字型跳過此條。
-  8. [legibility] 容器類符號可辨認性（legibility_overrides，spec 20260716）：
-                 P1 帶圈區段（U+2460-24FF / U+2776-2793）cmap 覆蓋 100%（Mango 由
-                 inject_symbol_glyphs 植入 Sarasa glyph）；override cp 逐字 —— EXACT
-                 雙向 |wr−target|≤WR_TOL（放大後三字型一致）、MIN_H 上界；共通
-                 hc/vc 容差 + bbox 高 ≥ MIN_LEGIBLE_EM（0.5em 可辨認下限）→
-                 align_symbols(enlarge) + inject_symbol_glyphs 的產出。invariant 5
-                 對 override cp 讓位（此條驗）。
+  8. [legibility] 容器類符號可辨認性（legibility_overrides，spec 20260716 +
+                 20260717 高橢圓）：P1 帶圈區段（U+2460-24FF / U+2776-2793）cmap
+                 覆蓋 100%（Mango 由 inject_symbol_glyphs 植入 Sarasa glyph）；
+                 override cp 逐字 —— EXACT 四元組雙向 |wr−t|≤WR_TOL **且**
+                 |hr−t|≤HR_TOL（非等比高橢圓，寬高各自鎖）＋**不溢格** assert
+                 bbox ⊆ [0, advance]（每字自含於格 ⇒ 任兩相鄰字 bbox 投影不重疊，
+                 連排不相黏的幾何保證）；MIN_H 上界 + bbox 高 ≥ MIN_LEGIBLE_EM
+                 （0.5em 可辨認下限）；共通 hc/vc 容差 → align_symbols(enlarge)
+                 + inject_symbol_glyphs 的產出。invariant 5 對 override cp 讓位（此條驗）。
 
 用法：
   python3 verify_font_metrics.py <font.ttf> [font2.ttf ...]
@@ -63,15 +65,15 @@ sys.path.insert(0, SCRIPT_DIR)
 # DRY：fit 的縮放上限唯一定義在 fit_glyph_to_advance，驗證沿用同一常數。
 from fit_glyph_to_advance import MAX_RATIO
 # DRY：符號對齊的 target 表與容差唯一定義在 align_symbols / iosevka_targets，驗證沿用。
-from align_symbols import TARGETS, WR_TOL, HC_TOL, VC_TOL
+from align_symbols import TARGETS, WR_TOL, HR_TOL, HC_TOL, VC_TOL
 # DRY：可辨認性 override 表唯一定義在 legibility_overrides（gen 自動產生），驗證沿用。
 from legibility_overrides import (
-    OVERRIDES, OVERRIDES_EXACT, MIN_LEGIBLE_EM, P1_RANGES, CIRCLED_WR,
+    OVERRIDES_EXACT, OVERRIDES_MIN_H, OVERRIDE_CPS, MIN_LEGIBLE_EM, P1_RANGES,
 )
-# 表健全性守門（QA F2 事故防線）：表若被範圍外的 --circled-wr 重生（如 0-表），
+# 表健全性守門（QA F2 事故防線）：表若被壞量測來源重生（覆蓋缺、溢格值域），
 # 逐字 invariant 會與壞表「自洽通過」——在 import 時就擋，golden gate 不背書壞表。
-from gen_legibility_overrides import validate_circled_wr
-validate_circled_wr(CIRCLED_WR)
+from gen_legibility_overrides import validate_exact_table
+validate_exact_table(OVERRIDES_EXACT)
 from box_tiling import check_tiling
 # DRY：calt 偵測唯一定義在 strip_calt，驗證沿用同一函式。
 from strip_calt import calt_feature_count
@@ -206,7 +208,7 @@ def verify_font(path):
         bad = []
         have = 0
         for cp, (target_wr, target_hc, target_vc) in sorted(TARGETS.items()):
-            if cp in OVERRIDES:
+            if cp in OVERRIDE_CPS:
                 continue
             gn = cmap.get(cp)
             if gn is None:
@@ -232,18 +234,45 @@ def verify_font(path):
             if not bad else f"{len(bad)}/{have} 未對齊：{', '.join(bad[:8])}",
         )
 
-        # 8. legibility：容器類符號可辨認性（override 表，spec 20260716）。
+        # 8. legibility：容器類符號可辨認性（override 表，spec 20260716 + 20260717）。
         #    (a) P1 帶圈區段 cmap 覆蓋 100%（Mango 由 inject_symbol_glyphs 植入）；
-        #    (b) override cp 逐字：EXACT 雙向 |wr−t|≤tol（三字型一致）、MIN_H 上界
-        #        wr≤t+tol；共通 hc/vc 容差 + bbox 高 ≥ MIN_LEGIBLE_EM（可辨認下限）。
-        #    P2 缺字（Mango 41 字）跳過——inject 範圍僅 P1（spec 修法 B），P2 缺字
-        #    走 fallback，非本 task 補字範圍。
+        #    (b) EXACT 逐字（四元組，非等比高橢圓）：雙向 |wr−t|≤WR_TOL 且
+        #        |hr−t|≤HR_TOL（寬高各自鎖）＋不溢格 bbox ⊆ [0, advance]——每字
+        #        自含於格 ⇒ 任兩相鄰字 bbox 投影不重疊（連排不相黏的幾何保證）；
+        #    (c) MIN_H 逐字（三元組，等比救援）：wr 上界 + bbox 高 ≥ MIN_LEGIBLE_EM；
+        #    共通 hc/vc 容差。P2 缺字（Mango 41 字）跳過——inject 範圍僅 P1（第一輪
+        #    spec 修法 B），P2 缺字走 fallback，非本 task 補字範圍。
         p1_missing = [
             cp for lo, hi in P1_RANGES for cp in range(lo, hi + 1) if cp not in cmap
         ]
         bad_leg = []
         have_leg = 0
-        for cp, (t_wr, t_hc, t_vc) in sorted(OVERRIDES.items()):
+        for cp, (t_wr, t_hr, t_hc, t_vc) in sorted(OVERRIDES_EXACT.items()):
+            gn = cmap.get(cp)
+            if gn is None:
+                continue
+            adv = hmtx[gn][0]
+            b = _bbox(font, gn)
+            if b is None or adv <= 0:
+                continue
+            have_leg += 1
+            wr = (b[2] - b[0]) / adv
+            hr = (b[3] - b[1]) / upm
+            hc = (b[0] + b[2]) / 2 / adv
+            vc = (b[1] + b[3]) / 2 / upm
+            if not (
+                abs(wr - t_wr) <= WR_TOL
+                and abs(hr - t_hr) <= HR_TOL
+                and abs(hc - t_hc) <= HC_TOL
+                and abs(vc - t_vc) <= VC_TOL
+                and b[0] >= 0
+                and b[2] <= adv
+            ):
+                bad_leg.append(
+                    f"U+{cp:04X}(wr={wr:.2f}/hr={hr:.2f}/hc={hc:.2f}/vc={vc:.2f}"
+                    f"/x[{b[0]:.0f},{b[2]:.0f}]adv{adv})"
+                )
+        for cp, (t_wr, t_hc, t_vc) in sorted(OVERRIDES_MIN_H.items()):
             gn = cmap.get(cp)
             if gn is None:
                 continue
@@ -256,13 +285,8 @@ def verify_font(path):
             hc = (b[0] + b[2]) / 2 / adv
             vc = (b[1] + b[3]) / 2 / upm
             h_em = (b[3] - b[1]) / upm
-            wr_ok = (
-                abs(wr - t_wr) <= WR_TOL
-                if cp in OVERRIDES_EXACT
-                else wr <= t_wr + WR_TOL
-            )
             if not (
-                wr_ok
+                wr <= t_wr + WR_TOL
                 and abs(hc - t_hc) <= HC_TOL
                 and abs(vc - t_vc) <= VC_TOL
                 and h_em >= MIN_LEGIBLE_EM
@@ -275,6 +299,7 @@ def verify_font(path):
             not p1_missing and not bad_leg,
             "legibility",
             f"帶圈 cmap {n_p1 - len(p1_missing)}/{n_p1}、override {have_leg} 字全達標"
+            f"（EXACT wr/hr 雙向＋不溢格）"
             if not p1_missing and not bad_leg
             else (
                 f"帶圈 cmap 缺 {len(p1_missing)}"

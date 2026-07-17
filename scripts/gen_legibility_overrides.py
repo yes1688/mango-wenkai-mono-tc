@@ -1,33 +1,41 @@
 #!/usr/bin/env python3
 """
-從三字型「乾淨原版」量測 P1/P2 容器類符號的長寬比，產生 legibility_overrides.py
-（可辨認性 override 表，單一事實源；align_symbols 與 verify_font_metrics 都吃它）。
-
-問題背景（docs/reports/20260716_cto_console_font_survey.md）：
-  U+2460-24FF / U+2776-2793「容器類」符號（圈/框裡有數字或字母）被 normalize 砍半
-  advance 後，align_symbols 依 Iosevka 小圈慣例縮到 0.436em，內容不可辨認。
-  U+2100-218F 的 №/℅/分數等複合符號（LXGW 楷體畫在全形字身）同病。
+產生 legibility_overrides.py（可辨認性 override 表，單一事實源；align_symbols
+與 verify_font_metrics 都吃它）。
 
 表的語意（兩類，語意不同故分兩張表）：
-  OVERRIDES_EXACT（P1 帶圈/括號/句點形全部）：無條件精準對齊 wr（放大或縮小），
-    三字型該區段 wr/hc/vc 落同一 golden 容差 → 視覺一致。
-  OVERRIDES_MIN_H（P2 複合字母/分數清單）：僅當 bbox 高 < MIN_LEGIBLE_EM 才放大到
-    wr（可辨認性救援）；已達標字型（如 Sarasa 原生半形設計）不動，避免誤傷。
+  OVERRIDES_EXACT（P1 帶圈 U+2460-24FF / U+2776-2793 全 190 字）：
+    cp -> (wr, hr, hc, vc) 四元組，**per-cp 量自 Iosevka Term Regular**
+    （--iosevka 指定，SHA256 記錄於產出檔頭）。align 非等比雙向精準對齊——
+    複刻 Iosevka Term 高橢圓（spec 20260717）：寬收回格內（① wr=0.872，
+    連排不相黏）、高拉到數字全高（① hr=0.744，可辨認性）。第一輪等比
+    wr=1.15 放大（連排相黏，Boss 反映）由此取代。
+  OVERRIDES_MIN_H（P2 複合字母/分數清單）：cp -> (wr, hc, vc) 三元組，僅當
+    bbox 高 < MIN_LEGIBLE_EM 才等比放大到 wr（可辨認性救援）；已達標字型
+    （如 Sarasa 原生半形設計）不動，避免誤傷。從三字型「乾淨原版」推導
+    （沿第一輪邏輯不變）。
 
-per-cp wr 的推導：類初值（帶圈 CIRCLED_WR / P2 1.0）為底；寬形字（⑽⒛№℡ 等
-長寬比 AR > 1 者）單靠類初值到不了掃描驗收的 0.5em 高度下限，故逐字拉高到
+P2 per-cp wr 的推導：基準 1.0 為底；寬形字（№℡ 等長寬比 AR > 1 者）單靠
+基準到不了掃描驗收的 0.5em 高度下限，故逐字拉高到
   wr = MIN_TARGET_EM × AR × UPM / half_advance
-（等比縮放下「寬度=wr×advance」⇔「高度=wr×advance/AR」，取 max(類初值, 所需值)）。
+（等比縮放下「寬度=wr×advance」⇔「高度=wr×advance/AR」，取 max(基準, 所需值)）。
 AR 量自原版（原版高 ≥ ORIG_TALL_EM 者才視為全高設計、參與拉高）。
 
+表健全性守門：validate_exact_table 驗 EXACT 覆蓋齊全 + 值域（wr ≤ WR_CAP
+不溢格、hr/hc/vc 合理帶）——gen 寫表前驗、verify import 時驗，壞來源重生
+的壞表兩頭都過不了（QA F2 事故防線的本輪版）。
+
 用法：
-  python3 gen_legibility_overrides.py                     # 原版取 git blob，覆寫 legibility_overrides.py
-  python3 gen_legibility_overrides.py --circled-wr 1.25   # 帶圈類基準 wr 改 1.25（Boss 三檔比較用）
-  python3 gen_legibility_overrides.py --originals-dir DIR # 原版改從目錄讀（上游下載備援）
-  python3 gen_legibility_overrides.py --scan              # 不產表：掃 production，報「高<0.5em 且原版≥0.7em」flag
+  python3 gen_legibility_overrides.py --iosevka <IosevkaTerm-Regular.ttf>
+                                                          # 覆寫 legibility_overrides.py
+  python3 gen_legibility_overrides.py --iosevka <ttf> --originals-dir DIR
+                                                          # P2 原版改從目錄讀（上游下載備援）
+  python3 gen_legibility_overrides.py --scan              # 不產表：掃 production，報
+                                                          # 「高<0.5em 且原版≥0.7em」flag
                                                           # （驗收判準；有 flag → exit 1）
 """
 
+import hashlib
 import os
 import subprocess
 import sys
@@ -43,8 +51,8 @@ from iosevka_targets import TARGETS
 REPO_ROOT = os.path.normpath(os.path.join(SCRIPT_DIR, ".."))
 FONTS_REL = "crates/hive-native-gui/assets/fonts"
 
-# 原版來源（與 rebuild-fonts.sh 同一套 git blob；Mango 原版缺 P1 整段，AR 量不到、
-# 也不需要——Mango 的 P1 由 inject_symbol_glyphs 從 Sarasa 植入，AR 同 Sarasa）。
+# 原版來源（與 rebuild-fonts.sh 同一套 git blob；P2 推導用。Mango 原版缺 P1
+# 整段，P1 由 inject_symbol_glyphs 從 Sarasa 植入，不需原版）。
 ORIGINALS = {
     "LXGW": ("LXGWWenKaiMonoTC-Regular.ttf", "8094ee4"),
     "Sarasa": ("SarasaMonoTC-Regular.ttf", "87917e0"),
@@ -55,40 +63,49 @@ PRODUCTION_REGULARS = [
     "SarasaMonoTC-Regular.ttf",
 ]
 
-# P1：帶圈字母數字 + 實心/空心帶圈數字（容器類，整段收）。
+# P1：帶圈字母數字 + 實心/空心帶圈數字（容器類，整段收，EXACT）。
 P1_RANGES = [(0x2460, 0x24FF), (0x2776, 0x2793)]
-# P2：字母符號 + 數字形式 block（逐字判定，僅收「被管線縮壞」者）。
+# P2：字母符號 + 數字形式 block（逐字判定，僅收「被管線縮壞」者，MIN_H）。
 P2_BLOCK = (0x2100, 0x218F)
 
-CIRCLED_WR_DEFAULT = 1.15  # 帶圈類基準 wr（spec 初值；Boss 三檔 1.0/1.15/1.25 挑定後鎖 golden）
-CIRCLED_WR_MIN, CIRCLED_WR_MAX = 1.0, 1.5  # --circled-wr 合理範圍（QA F2：真實輸入面要驗證）
-P2_BASE_WR = 1.0           # P2 基準 wr（spec 初值）
+P2_BASE_WR = 1.0           # P2 基準 wr（第一輪 spec 初值）
 MIN_LEGIBLE_EM = 0.50      # 可辨認性高度下限（驗收：掃描 0 flag 的判準）
-MIN_TARGET_EM = 0.52       # align 放大的目標高度（留 0.02em 餘裕給下限）
+MIN_TARGET_EM = 0.52       # P2 放大的目標高度（留 0.02em 餘裕給下限）
 ORIG_TALL_EM = 0.70        # 「原版是全高設計」判準（掃描 flag 的原版條件）
-P1_HC, P1_VC = 0.5, 0.34   # P1 置中目標（spec）
+
+# EXACT 值域（validate_exact_table；量測來源異常時 fail fast，不產壞表）。
+# WR_CAP 0.95：wr ≤ 0.95 時即使 hc 偏到容差邊（±0.03）bbox 仍完整落在
+# [0, advance] 內 → 不溢格（連排不相黏）是表層級的內在保證。
+# Iosevka Term 34.7.0 實測 P1 wr 全距 0.796-0.886，離 cap 有餘裕。
+WR_CAP = 0.95
+HR_RANGE = (0.3, 0.95)     # 實測 hr 全距 0.580-0.751
+HC_RANGE = (0.4, 0.6)      # 實測 hc 全距 0.466-0.500
+VC_RANGE = (0.2, 0.5)      # 實測 vc 全距 0.340-0.367
 
 HEADER = '''\
 #!/usr/bin/env python3
 """
 容器類符號可辨認性 override 表 — **自動產生，勿手改**。
-重生：python3 gen_legibility_overrides.py [--circled-wr {wr}]
+重生：python3 gen_legibility_overrides.py --iosevka <IosevkaTerm-Regular.ttf>
 
 兩張表語意不同（單一事實源；align_symbols 與 verify_font_metrics 都吃這裡）：
-  OVERRIDES_EXACT（P1 帶圈/括號/句點形）：cp -> (wr, hc, vc)，無條件精準對齊
-    （放大或縮小到 wr），三字型落同一容差 → 視覺一致。
+  OVERRIDES_EXACT（P1 帶圈）：cp -> (wr, hr, hc, vc)，非等比雙向精準對齊——
+    複刻 Iosevka Term 高橢圓（spec 20260717）：寬收回格內（連排不相黏）、
+    高 per-cp 抄 Iosevka（① hr=0.744 數字全高）。
   OVERRIDES_MIN_H（P2 複合字母/分數）：cp -> (wr, hc, vc)，僅當 bbox 高 <
-    MIN_LEGIBLE_EM 才放大到 wr；已達標的字型（Sarasa 原生半形設計）不動。
-寬形字（⑽⒛№℡ 等）wr 已按原版長寬比逐字拉高，保證等比放大後高 ≥ MIN_TARGET_EM。
+    MIN_LEGIBLE_EM 才等比放大到 wr；已達標的字型（Sarasa 原生半形設計）不動。
 產生邏輯與參數見 gen_legibility_overrides.py docstring。
 """
 
-CIRCLED_WR = {circled_wr}      # 帶圈類基準 wr（Boss 三檔挑定後鎖定）
-MIN_LEGIBLE_EM = {min_legible}   # 可辨認性高度下限（verify 的 golden floor）
-MIN_TARGET_EM = {min_target}    # align 放大的目標高度（留餘裕給下限）
+# EXACT 量測來源（per-cp 逐字量；重生時核對 SHA256 確保同一版本）
+IOSEVKA_SOURCE = {source!r}
+IOSEVKA_SHA256 = {sha!r}
+
+MIN_LEGIBLE_EM = {min_legible}   # 可辨認性高度下限（P2 救援判準 + verify golden floor）
+MIN_TARGET_EM = {min_target}    # P2 放大的目標高度（留餘裕給下限）
 P1_RANGES = {p1_ranges}  # 帶圈區段（inject_symbol_glyphs 植入範圍同此）
 
-# (wr, hc, vc)
+# (wr, hr, hc, vc) — per-cp 量自 Iosevka Term
 OVERRIDES_EXACT = {{
 '''
 
@@ -100,8 +117,8 @@ OVERRIDES_MIN_H = {
 
 FOOTER = '''}
 
-# 合併視圖（EXACT 優先；兩表 cp 不重疊，verify 逐字迭代用）
-OVERRIDES = {**OVERRIDES_MIN_H, **OVERRIDES_EXACT}
+# override cp 集合（verify invariant 5 讓位判定用；兩表 shape 不同，值不合併）
+OVERRIDE_CPS = frozenset(OVERRIDES_EXACT) | frozenset(OVERRIDES_MIN_H)
 '''
 
 
@@ -145,19 +162,72 @@ def _load_originals(originals_dir):
     return fonts
 
 
-def validate_circled_wr(value):
-    """驗證 --circled-wr 引數（QA F2，task-ce5c0a98）：這是 Boss 挑檔位的真實
-    輸入面，範圍外或非數字一律 ValueError，不靜默接受（如打錯的 0）。"""
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        raise ValueError(f"--circled-wr 需要數字，收到 {value!r}") from None
-    if not (CIRCLED_WR_MIN <= v <= CIRCLED_WR_MAX):
+def validate_exact_table(table):
+    """EXACT 表健全性守門：P1 覆蓋齊全 + 逐行值域。
+
+    量測來源異常（錯版本、缺字、壞檔）重生出的壞表，align/verify 會與它
+    「自洽通過」——故 gen 寫表前驗、verify import 時驗，兩頭擋。
+    wr ≤ WR_CAP 是「不溢格 → 連排不相黏」的表層保證。"""
+    expected = set()
+    for lo, hi in P1_RANGES:
+        expected |= set(range(lo, hi + 1))
+    if set(table) != expected:
+        missing = expected - set(table)
+        extra = set(table) - expected
         raise ValueError(
-            f"--circled-wr {v} 超出合理範圍 [{CIRCLED_WR_MIN}, {CIRCLED_WR_MAX}]"
-            "（帶圈 glyph 寬/半格覆蓋率；<1 縮回不可辨認、>1.5 溢出過半格）"
+            f"EXACT 表覆蓋異常：缺 {len(missing)} 字"
+            + (f"（如 U+{min(missing):04X}）" if missing else "")
+            + (f"、多 {len(extra)} 字" if extra else "")
         )
-    return v
+    for cp, row in table.items():
+        if len(row) != 4:
+            raise ValueError(f"U+{cp:04X}：EXACT 應為 (wr, hr, hc, vc)，收到 {row!r}")
+        wr, hr, hc, vc = row
+        if not (0 < wr <= WR_CAP):
+            raise ValueError(f"U+{cp:04X} wr={wr} 超出 (0, {WR_CAP}]（溢格風險，連排會相黏）")
+        if not (HR_RANGE[0] < hr <= HR_RANGE[1]):
+            raise ValueError(f"U+{cp:04X} hr={hr} 超出 {HR_RANGE}")
+        if not (HC_RANGE[0] <= hc <= HC_RANGE[1]):
+            raise ValueError(f"U+{cp:04X} hc={hc} 超出 {HC_RANGE}")
+        if not (VC_RANGE[0] <= vc <= VC_RANGE[1]):
+            raise ValueError(f"U+{cp:04X} vc={vc} 超出 {VC_RANGE}")
+
+
+def build_exact_rows(iosevka_path):
+    """從 Iosevka Term 量 P1 每字 (wr, hr, hc, vc)。回傳 (source_desc, rows)，
+    rows = [(cp, wr, hr, hc, vc)]，source_desc 含 name table 的家族與版本字串
+    （可追溯性：檔名不帶版本）。缺字即 error（Iosevka Term 34.7.0 P1 覆蓋
+    100%；缺字 = 拿錯包）。"""
+    font = TTFont(iosevka_path)
+    try:
+        family = font["name"].getDebugName(4) or "?"
+        version = font["name"].getDebugName(5) or "?"
+        source_desc = f"{os.path.basename(iosevka_path)} ({family} {version})"
+        cmap = font.getBestCmap() or {}
+        upm = font["head"].unitsPerEm
+        rows = []
+        for lo, hi in P1_RANGES:
+            for cp in range(lo, hi + 1):
+                b = _bbox(font, cmap, cp)
+                if b is None:
+                    raise ValueError(
+                        f"量測來源缺 U+{cp:04X}（{iosevka_path} 非完整 Iosevka Term？）"
+                    )
+                gn = cmap[cp]
+                adv = font["hmtx"].metrics[gn][0]
+                if adv <= 0:
+                    raise ValueError(f"U+{cp:04X} advance={adv} 非法")
+                w, h = b[2] - b[0], b[3] - b[1]
+                rows.append((
+                    cp,
+                    round(w / adv, 3),
+                    round(h / upm, 3),
+                    round((b[0] + b[2]) / 2 / adv, 3),
+                    round((b[1] + b[3]) / 2 / upm, 3),
+                ))
+        return source_desc, rows
+    finally:
+        font.close()
 
 
 def _wr_needed(orig_w, orig_h, half_adv, upm):
@@ -166,27 +236,12 @@ def _wr_needed(orig_w, orig_h, half_adv, upm):
     return MIN_TARGET_EM * ar * upm / half_adv
 
 
-def build_tables(originals, circled_wr):
-    """回傳 (exact_rows, min_h_rows)，皆為 [(cp, wr, hc, vc)]。"""
+def build_min_h_rows(originals):
+    """P2 救援清單（沿第一輪邏輯）。回傳 [(cp, wr, hc, vc)]。"""
     measured = {}  # label -> (font, cmap, upm, half_adv)
     for label, font in originals.items():
         cmap = font.getBestCmap() or {}
         measured[label] = (font, cmap, font["head"].unitsPerEm, _half_advance(font, cmap))
-
-    exact_rows = []
-    for lo, hi in P1_RANGES:
-        for cp in range(lo, hi + 1):
-            wr = circled_wr
-            for font, cmap, upm, half in measured.values():
-                b = _bbox(font, cmap, cp)
-                if b is None:
-                    continue
-                w, h = b[2] - b[0], b[3] - b[1]
-                # 原版全高設計者才參與拉高（矮設計維持類基準，不無謂放大）
-                if h <= 0 or h / upm < ORIG_TALL_EM:
-                    continue
-                wr = max(wr, _wr_needed(w, h, half, upm))
-            exact_rows.append((cp, round(wr, 3), P1_HC, P1_VC))
 
     min_h_rows = []
     for cp in range(P2_BLOCK[0], P2_BLOCK[1] + 1):
@@ -210,13 +265,18 @@ def build_tables(originals, circled_wr):
                 wr = max(wr, _wr_needed(w, h, half, upm))
         if needy:
             min_h_rows.append((cp, round(wr, 3), 0.5, tvc))
-    return exact_rows, min_h_rows
+    return min_h_rows
 
 
-def generate(originals_dir, circled_wr):
+def generate(originals_dir, iosevka_path):
+    with open(iosevka_path, "rb") as f:
+        sha = hashlib.sha256(f.read()).hexdigest()
+    source_desc, exact_rows = build_exact_rows(iosevka_path)
+    validate_exact_table({cp: (wr, hr, hc, vc) for cp, wr, hr, hc, vc in exact_rows})
+
     originals = _load_originals(originals_dir)
     try:
-        exact_rows, min_h_rows = build_tables(originals, circled_wr)
+        min_h_rows = build_min_h_rows(originals)
     finally:
         for f in originals.values():
             f.close()
@@ -227,20 +287,21 @@ def generate(originals_dir, circled_wr):
             f"(0x{lo:04X}, 0x{hi:04X})" for lo, hi in P1_RANGES
         ) + "]"
         f.write(HEADER.format(
-            wr=circled_wr,
-            circled_wr=circled_wr,
+            source=source_desc,
+            sha=sha,
             min_legible=MIN_LEGIBLE_EM,
             min_target=MIN_TARGET_EM,
             p1_ranges=p1_ranges_repr,
         ))
-        for cp, wr, hc, vc in exact_rows:
-            f.write(f"    0x{cp:04X}: ({wr}, {hc}, {vc}),  # {chr(cp)}\n")
+        for cp, wr, hr, hc, vc in exact_rows:
+            f.write(f"    0x{cp:04X}: ({wr}, {hr}, {hc}, {vc}),  # {chr(cp)}\n")
         f.write(MID)
         for cp, wr, hc, vc in min_h_rows:
             f.write(f"    0x{cp:04X}: ({wr}, {hc}, {vc}),  # {chr(cp)}\n")
         f.write(FOOTER)
     print(
-        f"已產生 {out}：EXACT {len(exact_rows)} 字（帶圈基準 wr={circled_wr}）"
+        f"已產生 {out}：EXACT {len(exact_rows)} 字"
+        f"（per-cp 量自 {source_desc}，sha256={sha[:12]}…）"
         f" + MIN_H {len(min_h_rows)} 字"
     )
 
@@ -252,8 +313,9 @@ def scan(originals_dir):
     U+2100-218F block**：ℹ 等「對齊 Iosevka 屬正常」的小字（spec 不修名單）雖在
     block 內且高 <0.5em，但那是 Iosevka 自身的小設計，不是管線縮壞，不 flag。"""
     originals = _load_originals(originals_dir)
-    exact_rows, min_h_rows = build_tables(originals, CIRCLED_WR_DEFAULT)
-    cps = [cp for cp, _, _, _ in exact_rows] + [cp for cp, _, _, _ in min_h_rows]
+    min_h_rows = build_min_h_rows(originals)
+    cps = [cp for lo, hi in P1_RANGES for cp in range(lo, hi + 1)]
+    cps += [cp for cp, _, _, _ in min_h_rows]
     total_flags = 0
     try:
         orig_by_file = {fn: originals[label] for label, (fn, _) in ORIGINALS.items()}
@@ -262,7 +324,7 @@ def scan(originals_dir):
             prod = TTFont(path)
             pc = prod.getBestCmap() or {}
             pu = prod["head"].unitsPerEm
-            # Mango 原版缺整段（本 task 由 Sarasa 植入），原版高以植入來源 Sarasa 為準。
+            # Mango 原版缺整段（P1 由 Sarasa 植入），原版高以植入來源 Sarasa 為準。
             orig = orig_by_file.get(fn, originals["Sarasa"])
             oc = orig.getBestCmap() or {}
             ou = orig["head"].unitsPerEm
@@ -293,19 +355,15 @@ def scan(originals_dir):
 def main():
     args = sys.argv[1:]
     originals_dir = None
-    circled_wr = CIRCLED_WR_DEFAULT
+    iosevka_path = None
     do_scan = False
     i = 0
     while i < len(args):
         if args[i] == "--originals-dir":
             originals_dir = args[i + 1]
             i += 2
-        elif args[i] == "--circled-wr":
-            try:
-                circled_wr = validate_circled_wr(args[i + 1])
-            except ValueError as e:
-                print(str(e), file=sys.stderr)
-                sys.exit(2)
+        elif args[i] == "--iosevka":
+            iosevka_path = args[i + 1]
             i += 2
         elif args[i] == "--scan":
             do_scan = True
@@ -315,8 +373,14 @@ def main():
             sys.exit(2)
     if do_scan:
         scan(originals_dir)
-    else:
-        generate(originals_dir, circled_wr)
+        return
+    if iosevka_path is None:
+        print("產表需要 --iosevka <IosevkaTerm-Regular.ttf>（EXACT 量測來源）", file=sys.stderr)
+        sys.exit(2)
+    if not os.path.exists(iosevka_path):
+        print(f"檔案不存在：{iosevka_path}", file=sys.stderr)
+        sys.exit(2)
+    generate(originals_dir, iosevka_path)
 
 
 if __name__ == "__main__":

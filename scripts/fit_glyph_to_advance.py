@@ -85,10 +85,12 @@ def _glyph_bounds(font, glyph_name):
     return bp.bounds
 
 
-def apply_outline_transform(font, glyph_name, scale, dx, dy):
+def apply_outline_transform(font, glyph_name, scale, dx, dy, scale_y=None):
     """對 glyph outline 原地套 (scale, dx, dy) 並更新 lsb=新 xMin（advance 不變）。
 
-    語意：new_pt = (x*scale + dx, y*scale + dy)。回傳新 xMin。
+    語意：new_pt = (x*scale + dx, y*scale_y + dy)。回傳新 xMin。
+    scale_y 省略時 = scale（等比，既有呼叫端行為不變）；給定時 x/y 各自縮放
+    （legibility EXACT 高橢圓路徑，spec 20260717）。
 
     關鍵：替換 outline 後必須把 hmtx 的 lsb（left side bearing）更新成新 xMin。
     否則 fontTools glyphSet 在 draw() 時會依「舊 lsb − 新 xMin」把 glyph 水平
@@ -97,9 +99,11 @@ def apply_outline_transform(font, glyph_name, scale, dx, dy):
     composite glyph 在 draw() 時被 decompose 成 contour，再過 transform。
     供 fit_glyph 與 align_symbols 共用（DRY：outline 替換邏輯只此一份）。
     """
+    if scale_y is None:
+        scale_y = scale
     glyph_set = font.getGlyphSet()
     tt_pen = TTGlyphPen(glyph_set)
-    transform_pen = TransformPen(tt_pen, (scale, 0, 0, scale, dx, dy))
+    transform_pen = TransformPen(tt_pen, (scale, 0, 0, scale_y, dx, dy))
     glyph_set[glyph_name].draw(transform_pen)
     new_glyph = tt_pen.glyph()
 

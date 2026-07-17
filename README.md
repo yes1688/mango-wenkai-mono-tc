@@ -23,7 +23,7 @@ Mango WenKai 把它改造成終端可用的楷體：符號逐字對齊 Iosevka T
 - **楷體風格** — 保留 LXGW WenKai 的書法美感，終端裡也能品味楷書
 - **符號逐字對齊 Iosevka Term** — 箭頭、幾何、標點、技術符號全部置中不爆框
 - **Box Drawing 無縫 tiling** — 框線植入自 Sarasa Mono TC（be5invis），端點觸界畫框接得起來
-- **帶圈符號可辨認** — ①②③❶ 等帶圈字母數字與 № ⅓ ℡ 等複合符號放大到 16px 可辨認（楷體寬形字逐字調校）
+- **帶圈符號可辨認** — ①②③❶ 等帶圈字母數字高橢圓化（複刻 Iosevka Term 比例）：高達數字全高、寬不溢半格，16px 可辨認且連排不相黏；№ ⅓ ℡ 等複合符號逐字調校
 - **中英文寬度 2:1 嚴格對齊** — East Asian Width 正規化
 - **Regular + Bold 兩字重** — Bold 使用 Medium (500) 字重頂替，保留楷體筆鋒（楷體不做 700 加粗，會毀壞起收筆）
 - **連字移除** — 終端不該有 ligature
@@ -61,6 +61,18 @@ Bold 額外經過 `retag_weight.py`（Medium 500 → Bold 700 re-tag）。
 
 
 ## 更新日誌
+
+### 2026-07-17 — 帶圈符號改非等比高橢圓（複刻 Iosevka Term）
+
+- **①②③❶⑴⒈ 等 190 字改高橢圓**（取代 2026-07-16 的等比放大 wr=1.15）：
+  寬收回半格內（① wr=0.872，**連排 ①②③ 不再相黏**）、高拉到數字全高
+  （① 0.744em，16px 可辨認性更好）。比例 per-cp 逐字量自 Iosevka Term
+  Regular v34.7.0（SHA256 記錄於 `scripts/legibility_overrides.py` 檔頭）——
+  Iosevka Term 實證的半形帶圈業界做法：窄橢圓、內容近全高
+- **幾何保證不溢格**：每字 bbox 完整落在自身半格內（verify 新增 assert），
+  任兩相鄰帶圈字投影不重疊
+- 管線：`align_symbols.py` EXACT 名單支援非等比縮放（僅帶圈區段；其他符號
+  維持等比不變形）；`verify_font_metrics.py` invariant 8 改驗寬高雙向＋不溢格
 
 ### 2026-07-16 — 帶圈符號可辨認性
 
